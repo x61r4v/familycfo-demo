@@ -1,0 +1,79 @@
+name: Deploy demo
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+concurrency:
+  group: pages
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build static demo of nmazuz/familycfo (demo data only)
+        run: |
+          git clone https://github.com/nmazuz/familycfo.git app
+          cd app
+          git checkout c32d447a2acf819826705c2b6bb28572973a073e
+          npm install
+          npm run demo
+          (BANK_DB=demo.db npx tsx src/server/index.ts > /tmp/api.log 2>&1 &)
+          (cd web && npx vite --host 127.0.0.1 > /tmp/vite.log 2>&1 &)
+          sleep 15
+          cat > /tmp/crawl.mjs <<'JS'
+          import puppeteer from '/home/runner/work/familycfo-demo/familycfo-demo/app/node_modules/puppeteer/lib/esm/puppeteer/puppeteer.js';
+          import fs from 'fs';
+          const routes=['/','/transactions','/fixed','/budgets','/trends','/insurance','/pension','/investments','/cashflow','/insights','/events','/businesses','/savings','/loans','/categories','/settings'];
+          const rec={};
+          const b=await puppeteer.launch({args:['--no-sandbox']});
+          const p=await b.newPage();
+          p.on('response',async r=>{const u=new URL(r.url()); if(u.pathname.startsWith('/api/')&&r.request().method()==='GET'){try{rec[u.pathname.slice(4)+u.search]=await r.text();}catch{}}});
+          for(const r of routes){await p.goto('http://127.0.0.1:5180'+r,{waitUntil:'networkidle0'});await new Promise(r=>setTimeout(r,800));}
+          fs.writeFileSync('web/src/rec.json',JSON.stringify(rec));
+          console.log(Object.keys(rec).length);
+          await b.close();
+          JS
+          node /tmp/crawl.mjs
+          pkill -f vite || true
+          pkill -f server/index.ts || true
+          cat > web/src/staticShim.ts <<'TS'
+          import rec from './rec.json';
+          const data = rec as Record<string, string>;
+          const orig = window.fetch.bind(window);
+          window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+            const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url, location.href);
+            if (!url.pathname.startsWith('/api/')) return orig(input, init);
+            const method = (init?.method ?? 'GET').toUpperCase();
+            const json = (b: string, status = 200) => new Response(b, { status, headers: { 'content-type': 'application/json' } });
+            if (method !== 'GET') return json(JSON.stringify({ ok: true, demo: true }));
+            const key = url.pathname.slice(4) + url.search;
+            if (data[key] !== undefined) return json(data[key]);
+            const base = url.pathname.slice(4);
+            const k = Object.keys(data).find((x) => x.split('?')[0] === base);
+            if (k) return json(data[k]);
+            return json(JSON.stringify({ error: 'static demo, no data' }), 404);
+          };
+          TS
+          sed -i "1i import './staticShim';" web/src/main.tsx
+          sed -i "s/import { BrowserRouter }/import { HashRouter as BrowserRouter }/" web/src/main.tsx
+          cd web
+          npx vite build --base ./
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: app/web/dist
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.d.outputs.page_url }}
+    steps:
+      - id: d
+        uses: actions/deploy-pages@v4
